@@ -1,8 +1,6 @@
 from ast import Call
-from asyncio.log import logger
 import logging 
 from typing import Dict, List, Tuple, Any
-import datetime
 import sqlite3
 from telegram import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import (
@@ -22,57 +20,83 @@ logging.basicConfig(
 
 )
 
-############
-# DATABASE #
-############
-
-conn = sqlite3.connect(
-    "payliaodb.db", 
-    detect_types = sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
-    check_same_thread = False
-)
+# initialise database
+conn = sqlite3.connect("payliaodb.db")
 
 curr = conn.cursor()
 
-reset_cmd = """
-DROP TABLE IF EXISTS Orders;
-"""
-curr.execute(reset_cmd)
-
-reset_cmd = """
-DROP TABLE IF EXISTS Options
-"""
-curr.execute(reset_cmd)
-
-create_cmd = """
-CREATE TABLE IF NOT EXISTS Orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL,
-    datetime_created TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+db_cmds = """ 
+CREATE TABLE Orders (
+    id INTEGER PRIMARY KEY,
+    payer_id INTEGER NOT NULL,
+    chat_id INTEGER,
+    datetime_created DATETIME NOT NULL,
     descr TEXT,
     closed BOOLEAN NOT NULL DEFAULT FALSE
 );
-"""
-curr.execute(create_cmd)
 
-create_cmd = """
-CREATE TABLE IF NOT EXISTS Options (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE Options (
+    id INTEGER PRIMARY KEY,
     order_id INTEGER NOT NULL REFERENCES Orders(id) ON DELETE CASCADE,
     payee_id INTEGER NOT NULL,
     cost FLOAT NOT NULL,
     descr TEXT NOT NULL,
-    paid BOOLEAN NOT NULL DEFAULT FALSE,
+    paid BOOLEAN DEFAULT NULL,
     acknowledged BOOLEAN NOT NULL DEFAULT FALSE
 );
 """
-curr.execute(create_cmd)
 
-conn.commit()
+# stand-in for a SQL database in the form of Dict[table_name: str, table: Table]
+# see database.sql file for actual sql tables
+database = {
+    "Orders": {
+        1: (1, "eg_chat_id", "eg_datetime", "eg_order"),
+        2: (2, "eg_chat_id_2", "eg_datetime_2", "eg_order_2")
+    },
+    "Items": {
+        1: (1, 2, 5.00, "eg_item_1"),
+        2: (1, 3, 10.00, "eg_item_2"),
+        3: (2, 3, 3.00, "eg_item_3"),
+        4: (2, 1, 4.00, "eg_item_4")
+    }
+}
 
-#############################
-# CONSTANTS AND DEFINITIONS #
-#############################
+class Order:
+
+    def __init__(self, name, date, time, payer):
+        self.name = name
+        self.date = date
+        self.time = time
+        self.payer = payer
+        self.open = True
+        self.options = []
+    
+    def add_options(self, option):
+        self.options.append(option)
+    
+    def remove_option(self, id):
+        self.options.remove(id)
+    
+    def get_title(self):
+        return "{} created on {} {} by {}".format(self.name, self.date, self.time, self.payer)
+
+    def printer(self, title, options):
+        option_str = "\n".join(options)
+        return title + "\n" + option_str
+
+    def print_all(self):
+        option_lst = []
+        for option in self.options:
+            option_lst.append(option.to_string())
+        return self.printer(self.get_title(), option_lst)
+    
+    def print_unpaid(self):
+        option_lst = []
+        for option in self.options:
+            if not option.is_paid():
+                option_lst.append(option.to_string())
+        title = self.get_title() + " unpaid"
+        return self.printer(title, option_lst)
 
 # State definitions for top level
 SELECTING_ACTION, NAME_ORDER, SHOW_OPEN_SELF_PAYER, SHOW_OPEN, SHOW_UNPAID_SELF_PAYER, SHOW_UNPAID_SELF_PAYEE, SHOW_ALL = map(str, range(7))
@@ -95,21 +119,14 @@ SELECT_UNPAID_OPTION, PROVIDE_PROOF, CONFIRM_PROOF = map(str, range(21, 24))
 # State definitions for showing
 SHOW_PAYEE, SHOW_PAYEE_UNPAID, SHOW_ALL_UNPAID, SHOW_PAYER, SHOW_PAYER_UNPAID = map(str, range(25, 30))
 
-# Meta states
-STOPPING, TYPING = map(str, range(30, 32))
-
-# Shortcut for ConversationHandler.END
+#Shortcut for ConversationHandler.END
 END = ConversationHandler.END
 
 # Constants
 (
     START_OVER,
     CURRENT_LEVEL,
-    DESCRIPTION,
-    COST,
-    ORDER,
-    OPTION,
-) = map(chr, range(32, 38))
+) = map(chr, range(30, 32))
 
 
 #######################
@@ -118,36 +135,22 @@ END = ConversationHandler.END
 
 def start(update: Update, context: CallbackContext) -> str:
     """Select an action: View existing orders or start new order"""
-    text = (
+    desc = (
         "You can view existing orders or start a new order. To stop, type /stop"
     )
     
     buttons = [
         [
             InlineKeyboardButton(
-                text = 'Create new order',
-                callback_data = str(NAME_ORDER)
-            ),
-            InlineKeyboardButton(
-                text = "Close Order",
-                callback_data = str(SHOW_OPEN_SELF_PAYER)
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text = "Add to order",
-                callback_data = str(SHOW_OPEN)
-            ),
-            InlineKeyboardButton(
-                text = "Provide proof",
-                callback_data = str(SHOW_UNPAID_SELF_PAYEE)
-            )
-        ],
-        [
-            InlineKeyboardButton(
                 text = 'View existing orders',
                 callback_data = str(SHOW_ALL)
             ),
+            InlineKeyboardButton(
+                text = 'Create new order',
+                callback_data = str(NAME_ORDER)
+            )
+        ],
+        [
             InlineKeyboardButton(
                 text = 'Done',
                 callback_data = str(END)
@@ -159,7 +162,7 @@ def start(update: Update, context: CallbackContext) -> str:
     if context.user_data.get(START_OVER):
         update.callback_query.answer()
         update.callback_query.edit_message_text(
-            text = text,
+            text = desc,
             reply_markup = keyboard
         )
     else:
@@ -167,155 +170,18 @@ def start(update: Update, context: CallbackContext) -> str:
             "Thank you for using PayLahBot! I can help you collect orders and payments."
         )
         update.message.reply_text(
-            text = text,
+            text = desc,
             reply_markup = keyboard
         )
     
     context.user_data[START_OVER] = False
     return SELECTING_ACTION
 
-##########################
-# CREATE ORDER FUNCTIONS #
-##########################
-
-def ask_for_new_order_name(update: Update, context: CallbackContext) -> str:
-    ## Answering the user
-    text = "Name this order."
-    update.callback_query.answer()
-    update.callback_query.edit_message_text(text=text)
-
-    return TYPING
-
-def confirm_name(update: Update, context: CallbackContext) -> str:
-    msg = update.message.text
-    logger.info(msg)
-    username = update.message.from_user.username
-    user_data = context.user_data
-    user_data[ORDER] = (username, msg)
-    text = f"@{username}, create order {msg}?"
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text = "Yes",
-                callback_data = str(ACCEPT_NAME)
-            ),
-            InlineKeyboardButton(
-                text = "Change name",
-                callback_data = str(NAME_ORDER)
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text = "Cancel, return to start",
-                callback_data = str(SELECTING_ACTION)
-            )
-        ]
-    ]
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    update.message.reply_text(
-        text = text,
-        reply_markup = keyboard
-    )
-
-    return CONFIRM_NAME
-
-def accept_name(update: Update, context: CallbackContext) -> str:
-    # logger.info(update.message.text)
-    new_order = context.user_data[ORDER]
-    order_name = new_order[1]
-    text = f"Order {order_name} created."
-    
-    ## Create an empty order in the database
-    insert_new_order_cmd = f"""
-    INSERT INTO Orders(username, descr)
-    VALUES ('{new_order[0]}', '{new_order[1]}')
-    """
-    curr.execute(insert_new_order_cmd)
-    conn.commit()
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text = "Done",
-                callback_data = SELECTING_ACTION
-            )
-        ]
-    ]
-
-    keyboard = InlineKeyboardMarkup(buttons)
-
-    update.callback_query.answer()
-    update.callback_query.edit_message_text(
-        text = text,
-        reply_markup = keyboard
-    )
-
-    return ACCEPT_NAME
-
-def end_create_order(update: Update, context: CallbackContext) -> str:
-    context.user_data[START_OVER] = True
-    start(update, context)
-    return SELECTING_ACTION
-
-
-#########################
-# CLOSE ORDER FUNCTIONS #
-#########################
-
-def select_closable(update: Update, context: CallbackContext) -> str:
-    return SHOW_OPEN_SELF_PAYER
-
-def confirm_close(update: Update, context: CallbackContext) -> str:
-    return CONFIRM_CLOSURE
-
-def accept_close(update: Update,    context: CallbackContext) -> str:
-    return ACCEPT_CLOSURE
-
-##########################
-# ADD TO ORDER FUNCTIONS #
-##########################
-
-def select_open(update: Update, context: CallbackContext) -> str:
-    return SHOW_OPEN
-
-###########################
-# PROVIDE PROOF FUNCTIONS #
-###########################
-
-def select_unpaid(update: Update, context: CallbackContext) -> str:
-    return SHOW_UNPAID_SELF_PAYEE
-
-#############################
-# SHOW ALL ORDERS FUNCTIONS #
-#############################
-
 def show_all_orders(update: Update, context = CallbackContext) -> str:
-    text = "All orders:\n"
-    
-    fetch_orders_cmd = """
-    SELECT * FROM Orders
-    ORDER BY id
-    ;
-    """
-    curr.execute(fetch_orders_cmd)
-    orders = curr.fetchall()
-
-    for order in orders:
-        order_id = order[0]
-        fetch_options_cmd = f"""
-        SELECT * FROM Options opt
-        WHERE opt.order_id = {order_id}
-        ORDER BY opt.id
-        ;
-        """
-        curr.execute(fetch_options_cmd)
-        options = curr.fetchall()
-        text += "Order: " + str(order) + "\n"
-        for option in options:
-            text += str(option) + "\n"
-        text += "\n"
+    # chat_id = update.message.chat.id
+    all_orders = list(database['Orders'].items())
+    all_orders.sort(key = lambda x: x[0]) # should sort by chronological order, for now is sorted by id
+    out = [order_to_string(order_id, order) for order_id, order in all_orders]
     
     buttons = [
         [
@@ -345,12 +211,22 @@ def show_all_orders(update: Update, context = CallbackContext) -> str:
 
     update.callback_query.answer()
     update.callback_query.edit_message_text(
-        text = text,
+        text = "\n\n".join(out),
         reply_markup = keyboard
     )
     context.user_data[START_OVER] = True
     return SHOW_ALL
 
+def order_to_string(order_id: int, order: Tuple[Any]) -> str:
+    all_items = database["Items"]
+    items_in_order_id = list(filter(lambda x: x[0] == order_id, all_items.values()))
+    out = [item_to_string(item) for item in items_in_order_id]
+    out.insert(0, f"Order {order_id}, created at {order[2]}, paid by {order[0]}")
+    return "\n".join(out)
+
+def item_to_string(item: Tuple[Any]) -> str:
+    out = f"{item[1]} bought {item[3]} for ${item[2]:.2f}"
+    return out
 
 def help(update: Update, context: CallbackContext) -> None:
     update.message.reply_text(f"/start to start the bot")
@@ -370,6 +246,24 @@ def end(update: Update, context: CallbackContext) -> int:
 
     return END
 
+##########################
+# SECOND LEVEL FUNCTIONS #
+##########################
+
+def create_new_order(update: Update, context: CallbackContext) -> str:
+    ## Answering the user
+    text = "Name this order."
+    update.callback_query.answer()
+    update.callback_query.edit_message_text(text=text)
+
+    ## Create an empty order in the database
+    new_order_id = database["Orders"].size()
+    database["Orders"][new_order_id] = ()
+
+    return NAME_ORDER
+
+def save_order(update: Update, context: CallbackContext) -> str:
+    pass
 
 ########
 # MAIN #
@@ -380,53 +274,33 @@ def main():
     dispatcher = updater.dispatcher
 
     # Second level ConversationHandler (creating order)
-    confirm_name_handlers = [
-        CallbackQueryHandler(accept_name, pattern = '^' + str(ACCEPT_NAME) + '$'),
-        CallbackQueryHandler(ask_for_new_order_name, pattern = '^' + str(NAME_ORDER) + '$'),
-    ]
+    # create_order_handler = ConversationHandler(
+    #     entry_points = [
+    #         CallbackQueryHandler(create_new_order, pattern = '^' + str(NAME_ORDER) + '$')
+    #     ],
+    #     states = {
+    #         ADDING_OPTION: [MessageHandler(Filters.text & ~Filters.command, save_order)],
 
-    create_order_handler = ConversationHandler(
-        entry_points = [
-            CallbackQueryHandler(ask_for_new_order_name, pattern = '^' + str(NAME_ORDER) + '$')
-        ],
-        states = {
-            TYPING: [MessageHandler(Filters.text & ~Filters.command, confirm_name)],
-            CONFIRM_NAME: confirm_name_handlers
-        },
-        fallbacks = [
-            CallbackQueryHandler(end_create_order, pattern = '^' + str(SELECTING_ACTION) + '$'),
-            CommandHandler('stop', stop)
-        ],
-        map_to_parent = {
-            END: SELECTING_ACTION,
-            SELECTING_ACTION: SELECTING_ACTION,
-            STOPPING: END,
-        }
-    )
+    #     },
+    #     fallbacks = [
+
+    #     ],
+    #     map_to_parent = {
+    #         SHOW_ALL: SHOWING,
+    #         STOPPING: END,
+    #     }
+    # )
 
     # Top level ConversationHandler (selecting action)
-
     selection_handlers = [
-        create_order_handler,
-        CallbackQueryHandler(
-            ask_for_new_order_name,
-            pattern = "^" + str(NAME_ORDER) + "$"
-        ),
-        CallbackQueryHandler(
-            select_closable,
-            pattern = "^" + str(SHOW_OPEN_SELF_PAYER)
-        ),
-        CallbackQueryHandler(
-            select_open,
-            pattern = "^" + str(SHOW_OPEN)
-        ),
-        CallbackQueryHandler(
-            select_unpaid,
-            pattern = "^" + str(SHOW_UNPAID_SELF_PAYEE)
-        ),
+        # _handler,
         CallbackQueryHandler(
             show_all_orders, 
             pattern = "^" + str(SHOW_ALL) + "$"
+        ),
+        CallbackQueryHandler(
+            create_new_order,
+            pattern = "^" + str(NAME_ORDER) + "$"
         ),
         CallbackQueryHandler(
             end,
@@ -442,7 +316,7 @@ def main():
             SHOW_ALL: [CallbackQueryHandler(start, pattern='^' + str(END) + '$')],
             SELECTING_ACTION: selection_handlers,
             NAME_ORDER: selection_handlers,
-            STOPPING: [CommandHandler('start', start)]
+            END: [CommandHandler('start', start)]
         },
         fallbacks = [
             CommandHandler('stop', stop)
