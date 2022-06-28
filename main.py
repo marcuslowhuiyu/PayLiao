@@ -565,7 +565,7 @@ def help(update: Update, context: CallbackContext) -> None:
 def stop(update: Update, context: CallbackContext) -> int:
     """End Conversation by command."""
     update.message.reply_text('Okay, bye.')
-    context.user_data[START_OVER] = True
+    context.user_data[START_OVER] = False
 
     return END
 
